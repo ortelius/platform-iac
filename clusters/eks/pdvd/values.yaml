@@ -1,22 +1,30 @@
-# clusters/gke/pdvd/values.yaml
-# Plain (non-secret) values for the pdvd HelmRelease on GKE.
+# clusters/eks/pdvd/values.yaml
+# Plain (non-secret) values for the pdvd HelmRelease on EKS.
 # Merged with secrets.enc.yaml by FluxCD before passing to Helm.
 #
-# Secret values (rbac_repo_token, github.clientSecret, github.privateKey,
-# smtp.username, smtp.password, arangodb_pass) live in secrets.enc.yaml.
+# certificateArn → terraform output: acm_certificate_arn
+# subnets        → terraform output: public_subnet_ids (comma-separated)
+#
+# Secret values live in secrets.enc.yaml (same structure as GKE,
+# re-encrypted with the EKS AWS KMS key).
 
 pdvd-frontend:
   graphqlEndpoint: "https://app.deployhub.com/api/v1/graphql"
   restapiEndpoint: "https://app.deployhub.com/api/v1"
   ingress:
-    type: glb
+    type: alb
     host: "app.deployhub.com"
-    staticIP: "static-app-ip"   # google_compute_global_address.app.name from terraform
+    scheme: "internet-facing"
+    certificateArn: ""        # fill from: terraform -chdir=terraform/eks output -raw acm_certificate_arn
+    subnets: ""               # fill from: terraform -chdir=terraform/eks output -json public_subnet_ids | jq -r 'join(",")'
 
 pdvd-backend:
   ingress:
-    type: glb
+    type: alb
     host: "app.deployhub.com"
+    scheme: "internet-facing"
+    certificateArn: ""        # same cert as above
+    subnets: ""               # same subnets as above
   rbac_repo: "https://github.com/ortelius/pdvd-rbac.git"
   apiBaseUrl: "https://app.deployhub.com"
   baseUrl: "https://app.deployhub.com"
