@@ -9,6 +9,7 @@ GitOps platform repository for the pdvd application stack. Terraform provisions 
 ```
 pdvd-platform/
 ├── deploy.sh                        # Single entrypoint to deploy GKE or EKS
+├── make-secrets.sh                  # Run once before deploy — creates secrets.enc.yaml
 │
 ├── terraform/
 │   ├── gke/
@@ -168,7 +169,7 @@ Terraform runs `aws eks describe-cluster` via an external data source to check w
 - Subnets tagged with `kubernetes.io/role/elb` and `kubernetes.io/role/internal-elb` so the ALB controller can discover them
 
 ### Phase 3 — EKS cluster (if cluster does not exist)
-- EKS control plane v1.32 created
+- EKS control plane v1.35 created
 - Managed node group: `t3.small` SPOT instances, 2–4 nodes across private subnets
 - OIDC provider resolved (used by ALB controller IRSA role)
 
@@ -272,7 +273,7 @@ TLS 1.2/1.3 only"]
 
             subgraph PRIV ["Private Subnets — us-east-1a / us-east-1c"]
 
-                subgraph EKS ["⎈ EKS Cluster  pdvd-eks v1.32"]
+                subgraph EKS ["⎈ EKS Cluster  pdvd-eks v1.35"]
 
                     subgraph NG ["Managed Node Group · t3.small SPOT · 2–4 nodes"]
                         direction LR
@@ -357,14 +358,82 @@ IRSA → aws-load-balancer-controller"]
 
 ---
 
-## Quick Reference — Terraform Outputs
+## Verifying the Deployment
 
-After `./deploy.sh eks apply`:
+After `./deploy.sh eks apply` completes, verify everything is running:
 
 ```bash
-terraform -chdir=terraform/eks output -raw acm_certificate_arn    # → values.yaml certificateArn
-terraform -chdir=terraform/eks output -raw age_public_key         # → clusters/.sops.yaml age key
-terraform -chdir=terraform/eks output -raw age_key_file           # → path to private key backup
-terraform -chdir=terraform/eks output -raw alb_controller_role_arn # → alb-controller SA annotation
-terraform -chdir=terraform/eks output -json public_subnet_ids | jq -r 'join(",")' # → values.yaml subnets
+# Check all Flux controllers are ready
+kubectl get pods -n flux-system
+
+# Expected output:
+# helm-controller-xxx             1/1  Running
+# kustomize-controller-xxx        1/1  Running
+# notification-controller-xxx     1/1  Running
+# source-controller-xxx           1/1  Running
+
+# Check pdvd application pods are running
+kubectl get pods -n pdvd
+
+# Expected output:
+# pdvd-frontend-xxx               1/1  Running
+# pdvd-backend-xxx                1/1  Running
+# pdvd-arangodb-xxx               1/1  Running
+
+# Check ALB controller is running
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+# Check Flux HelmReleases are reconciled
+kubectl get helmrelease -n pdvd
+
+# Expected output:
+# pdvd-frontend    True    Release reconciliation succeeded
+# pdvd-backend     True    Release reconciliation succeeded
+# pdvd-arangodb    True    Release reconciliation succeeded
+
+# Check the Ingress has an ALB hostname assigned
+kubectl get ingress -n pdvd
+
+# Expected output:
+# pdvd-frontend-ingress  <none>  app.deployhub.com  k8s-xxx.us-east-1.elb.amazonaws.com  80,443
+```
+
+## Accessing the App
+
+`deploy.sh` polls for the ALB hostname after apply and prints the DNS record to create. Once the ALB is ready you will see:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║  DNS Setup                                                   ║
+╠══════════════════════════════════════════════════════════════╣
+║  Create a CNAME record in your DNS provider:                 ║
+║                                                              ║
+║  Name : app.deployhub.com                                    ║
+║  Type : CNAME                                                ║
+║  Value: k8s-pdvd-xxx.us-east-1.elb.amazonaws.com            ║
+╠══════════════════════════════════════════════════════════════╣
+║  Once DNS propagates, open:                                  ║
+║    https://app.deployhub.com                                 ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+Add the CNAME in your DNS provider (Route 53, Cloudflare, Namecheap, GoDaddy, etc.) pointing your domain at the ALB hostname. DNS propagation typically takes 1–5 minutes.
+
+You also need a CNAME for ACM certificate validation (only required once — check `aws acm describe-certificate` for the validation record):
+
+```bash
+aws acm describe-certificate   --certificate-arn $(terraform -chdir=terraform/eks output -raw acm_certificate_arn)   --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
+```
+
+To test before DNS propagates:
+
+```bash
+ALB=$(kubectl get ingress -n pdvd pdvd-frontend-ingress   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+curl -sk -H "Host: app.deployhub.com" https://$ALB
+```
+
+Once DNS propagates, open:
+
+```
+https://app.deployhub.com
 ```
