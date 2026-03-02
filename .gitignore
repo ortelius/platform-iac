@@ -8,6 +8,7 @@ override.tf.json        # Local overrides in JSON
 *.tfplan                # Terraform plan output files (binary)
 *.tfvars                # Variable files with sensitive data
 *.tfvars.json           # JSON variable files
+*.bak
 
 # Ignore CLI configuration
 .terraformrc
