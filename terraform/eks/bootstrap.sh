@@ -52,7 +52,7 @@ fi
 git add .
 if ! git diff --cached --quiet; then
   git commit -m "chore(eks): update pdvd values with infrastructure outputs"
-  git push origin main
+  git push --set-upstream origin main
   echo "Pushed values.yaml updates"
 fi
 
