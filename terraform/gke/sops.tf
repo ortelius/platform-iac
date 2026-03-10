@@ -6,8 +6,6 @@
   and stored as a Kubernetes Secret in flux-system so kustomize-controller
   can decrypt SOPS-encrypted files without any cloud IAM, KMS, or
   Workload Identity dependency.
-
-  No GCP KMS, no service accounts, no Workload Identity needed.
 */
 
 resource "null_resource" "age_keygen" {
@@ -19,7 +17,6 @@ resource "null_resource" "age_keygen" {
     command = <<-CMD
       KEY_FILE="$HOME/.ssh/${var.cluster_name}.sops.key"
 
-      # Install age if not present
       if ! command -v age-keygen &>/dev/null; then
         echo "Installing age..."
         OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -39,7 +36,6 @@ resource "null_resource" "age_keygen" {
         rm -rf /tmp/age.tar.gz /tmp/age
       fi
 
-      # Generate key only if it doesn't already exist
       if [ ! -f "$KEY_FILE" ]; then
         echo "Generating age keypair -> $KEY_FILE"
         mkdir -p "$HOME/.ssh"
@@ -64,7 +60,6 @@ data "local_file" "age_pubkey" {
   depends_on = [null_resource.age_keygen]
 }
 
-# Create / update the sops-age Kubernetes secret in flux-system
 resource "null_resource" "sops_age_secret" {
   triggers = {
     cluster_name = var.cluster_name
@@ -90,7 +85,6 @@ resource "null_resource" "sops_age_secret" {
   depends_on = [null_resource.age_keygen]
 }
 
-# Write .sops.yaml with the age public key and commit it
 resource "null_resource" "sops_yaml" {
   triggers = {
     cluster_name = var.cluster_name
@@ -116,7 +110,7 @@ SOPS
       git add clusters/.sops.yaml
       if ! git diff --cached --quiet; then
         git commit -m "chore: update .sops.yaml with age public key for ${var.cluster_name}"
-        git push origin main
+        git push --set-upstream origin main
         echo ".sops.yaml committed"
       else
         echo ".sops.yaml unchanged"
@@ -131,7 +125,6 @@ SOPS
   depends_on = [null_resource.age_keygen]
 }
 
-# Patch kustomize-controller to mount the sops-age secret
 resource "null_resource" "flux_sops_patch" {
   triggers = {
     cluster_name = var.cluster_name
@@ -175,7 +168,7 @@ KUST
       git add clusters/gke/flux-system/kustomization.yaml
       if ! git diff --cached --quiet; then
         git commit -m "chore(gke): patch kustomize-controller to use sops-age secret"
-        git push origin main
+        git push --set-upstream origin main
         echo "kustomization.yaml committed"
       else
         echo "kustomization.yaml unchanged"
@@ -190,7 +183,6 @@ KUST
   depends_on = [null_resource.sops_age_secret, null_resource.sops_yaml]
 }
 
-# ── Outputs ───────────────────────────────────────────────────────────────────
 output "age_public_key" {
   description = "Age public key — used in .sops.yaml for encrypting secrets"
   value       = trimspace(data.local_file.age_pubkey.content)

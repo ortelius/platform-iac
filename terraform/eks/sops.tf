@@ -1,15 +1,12 @@
 /*
   sops.tf — EKS SOPS decryption via age key
 
-  Note: Age key generation and .sops.yaml creation are now securely handled
-  by deploy.sh prior to Terraform running. This file takes that generated key
-  and applies it to the EKS cluster.
+  Note: Age key generation and .sops.yaml creation are handled
+  by deploy.sh prior to Terraform running.
 */
 
-# Create / update the sops-age Kubernetes secret in flux-system
 resource "null_resource" "sops_age_secret" {
   triggers = {
-    # Re-run if the bootstrap finishes a new run
     flux_sync = null_resource.flux_bootstrap.id
   }
 
@@ -42,7 +39,6 @@ resource "null_resource" "sops_age_secret" {
   depends_on = [null_resource.flux_bootstrap]
 }
 
-# Patch kustomize-controller deployment to mount the sops-age secret
 resource "null_resource" "flux_sops_patch" {
   triggers = {
     cluster_name = var.cluster_name
@@ -83,13 +79,13 @@ KUST
       git stash || true
       git pull --rebase origin main
       git stash pop || true
-      
+
       git add clusters/eks/flux-system/kustomization.yaml
       git add clusters/.sops.yaml || true
-      
+
       if ! git diff --cached --quiet; then
         git commit -m "chore(eks): patch kustomize-controller to use sops-age secret"
-        git push origin main
+        git push --set-upstream origin main
         echo "kustomization.yaml committed"
       else
         echo "kustomization.yaml unchanged"
@@ -104,7 +100,6 @@ KUST
   depends_on = [null_resource.sops_age_secret]
 }
 
-# ── Outputs ───────────────────────────────────────────────────────────────────
 output "age_key_file" {
   description = "Path to the age private key — back this up securely"
   value       = pathexpand("~/.ssh/${var.cluster_name}.sops.key")

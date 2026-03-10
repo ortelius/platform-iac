@@ -24,13 +24,35 @@ terraform {
 }
 
 # ── Variables ─────────────────────────────────────────────────────────────────
-variable "aws_region"   { default = "us-east-1" }
-variable "cluster_name" { default = "pdvd-eks" }
-variable "vpc_cidr"     { default = "10.0.0.0/16" }
-variable "domain"       { default = "app.deployhub.com" }
+variable "aws_region" {
+  description = "AWS region to deploy into (e.g. us-east-1)"
+  type        = string
+}
 
-variable "github_org"  { default = "ortelius" }
-variable "github_repo" { default = "pdvd-platform" }
+variable "cluster_name" {
+  description = "EKS cluster name (e.g. pdvd-eks)"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC (e.g. 10.0.0.0/16)"
+  type        = string
+}
+
+variable "domain" {
+  description = "Public domain name for the application (e.g. app.deployhub.com)"
+  type        = string
+}
+
+variable "github_org" {
+  description = "GitHub organisation owning the platform repo (e.g. ortelius)"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository name for the platform (e.g. pdvd-platform)"
+  type        = string
+}
 variable "github_token" {
   description = "GitHub PAT with repo + admin:public_key scopes"
   type        = string
@@ -85,7 +107,6 @@ module "eks" {
   subnet_ids                     = module.vpc.private_subnets
   cluster_endpoint_public_access = true
 
-  # FIX: Grants K8s Admin permissions and natively creates the OIDC provider
   enable_cluster_creator_admin_permissions = true
   authentication_mode                      = "API_AND_CONFIG_MAP"
 
@@ -111,7 +132,6 @@ data "aws_iam_policy_document" "alb_assume" {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
       type        = "Federated"
-      # Safely reference the OIDC provider automatically created by the EKS module
       identifiers = [module.eks.oidc_provider_arn]
     }
     condition {
@@ -255,7 +275,7 @@ locals {
     git add .
     if ! git diff --cached --quiet; then
       git commit -m "chore(eks): update pdvd values with infrastructure outputs"
-      git push origin main
+      git push --set-upstream origin main
       echo "Pushed values.yaml updates"
     fi
 

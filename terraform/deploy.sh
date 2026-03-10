@@ -74,7 +74,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: pdvd-secrets
-  namespace: pdvd
+  namespace: flux-system
 stringData:
   values.yaml: |
     pdvd-arangodb:
@@ -90,13 +90,26 @@ $(echo "$GH_KEY" | sed 's/^/          /')
       password: "${SMTP_PASS}"
 YAML
 
-    # --input-type yaml --output-type yaml ensures sops reads and writes YAML, not JSON
+    # --encrypted-regex limits encryption to data/stringData only so Flux
+    # can read apiVersion/kind/metadata without 'missing Resource metadata' errors
     sops --encrypt \
       --input-type yaml \
       --output-type yaml \
       --age "$AGE_PUBKEY" \
+      --encrypted-regex '^(data|stringData)$' \
       "$TMP" > "$SECRETS_OUT"
     rm "$TMP"
+
+    # Commit secrets.enc.yaml and .sops.yaml together
+    REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
+    cd "$REPO_ROOT"
+    git add clusters/.sops.yaml "$SECRETS_OUT"
+    if ! git diff --cached --quiet; then
+      git commit -m "chore($CLUSTER): add encrypted secrets and sops config"
+      git push --set-upstream origin main
+      echo "✓ Secrets committed and pushed"
+    fi
+
     echo "✓ Secrets encrypted and written to $SECRETS_OUT"
   fi
 }
@@ -126,7 +139,7 @@ case "$ACTION" in
     terraform output
 
     if [[ "$CLUSTER" == "eks" ]]; then
-      DOMAIN=$(grep 'domain' "$WORKDIR/main.tf" | grep 'default' | cut -d'"' -f2 || echo "app.deployhub.com")
+      DOMAIN=$(grep 'domain' "$WORKDIR/terraform.tfvars" | cut -d'"' -f2)
       REGION=$(grep 'aws_region' "$WORKDIR/terraform.tfvars" | cut -d'"' -f2)
 
       echo "Waiting for ALB hostname..."
