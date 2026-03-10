@@ -48,11 +48,9 @@ ensure_secrets() {
   
   AGE_PUBKEY=$(grep "^# public key:" "$KEY_FILE" | awk '{print $4}')
   
-  # Only prompt for and generate secrets & sops.yaml if secrets file doesn't exist
   if [ ! -f "$SECRETS_OUT" ]; then
     echo "--- Interactive Secret Setup for $CLUSTER ---"
     
-    # Write .sops.yaml (Double escape backslashes so bash renders them as single backslashes)
     cat > "$SCRIPT_DIR/../clusters/.sops.yaml" <<SOPS
 creation_rules:
   - path_regex: clusters/eks/.*\\.yaml$
@@ -70,26 +68,36 @@ SOPS
     GH_KEY=$(cat)
 
     TMP=$(mktemp)
+    
+    # FIX: Wrap the raw values in a valid Kubernetes Secret manifest
     cat > "$TMP" <<YAML
-pdvd-arangodb:
-    arangodb_pass: "${DB_PASS}"
-pdvd-backend:
-    rbac_repo_token: "${RBAC_TOKEN}"
-    github:
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pdvd-secrets
+  namespace: pdvd
+stringData:
+  values.yaml: |
+    pdvd-arangodb:
+      arangodb_pass: "${DB_PASS}"
+    pdvd-backend:
+      rbac_repo_token: "${RBAC_TOKEN}"
+      github:
         clientSecret: "${GH_SECRET}"
         privateKey: |
-$(echo "$GH_KEY" | sed 's/^/            /')
-smtp:
-    username: "${SMTP_USER}"
-    password: "${SMTP_PASS}"
+$(echo "$GH_KEY" | sed 's/^/          /')
+    smtp:
+      username: "${SMTP_USER}"
+      password: "${SMTP_PASS}"
 YAML
+
+    # SOPS will detect this is a Kubernetes secret and only encrypt the stringData values
     sops --encrypt --age "$AGE_PUBKEY" "$TMP" > "$SECRETS_OUT"
     rm "$TMP"
     echo "✓ Secrets encrypted and written to $SECRETS_OUT"
   fi
 }
 
-# ── Pre-flight Check ──────────────────────────────────────────────────────────
 if [[ "$ACTION" == "apply" ]]; then
   ensure_secrets
 fi
@@ -100,7 +108,6 @@ if [[ "$CLUSTER" == "eks" && ! -f "$WORKDIR/alb-controller-iam-policy.json" ]]; 
     https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
 fi
 
-# ── Terraform Execution ───────────────────────────────────────────────────────
 echo "════════ Cluster: $CLUSTER | Action: $ACTION ════════"
 cd "$WORKDIR"
 terraform init -upgrade
@@ -139,7 +146,6 @@ case "$ACTION" in
     fi
     ;;
   destroy)
-    # Allow KMS key deletion during destroy
     [[ -f "sops.tf" ]] && sed -i.bak 's/prevent_destroy = true/prevent_destroy = false/' sops.tf || true
     terraform destroy -auto-approve
     [[ -f "sops.tf.bak" ]] && mv sops.tf.bak sops.tf || true
