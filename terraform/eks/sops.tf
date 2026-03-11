@@ -1,12 +1,51 @@
 /*
   sops.tf — EKS SOPS decryption via age key
 
-  Age key generation and .sops.yaml creation are handled by deploy.sh
-  prior to Terraform running. This file applies the key to the cluster
-  and patches kustomize-controller to use it.
+  The sops-age secret MUST exist in flux-system before Flux bootstrap runs,
+  otherwise kustomize-controller fails with CreateContainerConfigError.
+  This file creates it before bootstrap and re-applies it after.
 */
 
-resource "null_resource" "sops_age_secret" {
+# Step 1: Create sops-age secret BEFORE Flux bootstrap
+resource "null_resource" "sops_age_secret_pre_bootstrap" {
+  triggers = {
+    cluster_name = var.cluster_name
+  }
+
+  provisioner "local-exec" {
+    command = <<-CMD
+      KEY_FILE="$HOME/.ssh/${var.cluster_name}.sops.key"
+
+      if [ ! -f "$KEY_FILE" ]; then
+        echo "Error: $KEY_FILE not found. Run deploy.sh to generate it."
+        exit 1
+      fi
+
+      aws eks update-kubeconfig \
+        --name ${var.cluster_name} \
+        --region ${var.aws_region}
+
+      # Create flux-system namespace if it doesn't exist yet
+      kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl create secret generic sops-age \
+        --namespace=flux-system \
+        --from-file=age.agekey="$KEY_FILE" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      echo "✓ sops-age secret created in flux-system before bootstrap"
+    CMD
+
+    environment = {
+      AWS_DEFAULT_REGION = var.aws_region
+    }
+  }
+
+  depends_on = [module.eks]
+}
+
+# Step 2: Re-apply sops-age secret after bootstrap (in case bootstrap recreated the namespace)
+resource "null_resource" "sops_age_secret_post_bootstrap" {
   triggers = {
     flux_sync = null_resource.flux_bootstrap.id
   }
@@ -29,7 +68,7 @@ resource "null_resource" "sops_age_secret" {
         --from-file=age.agekey="$KEY_FILE" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      echo "✓ sops-age secret applied in flux-system"
+      echo "✓ sops-age secret re-applied in flux-system after bootstrap"
     CMD
 
     environment = {
@@ -40,6 +79,7 @@ resource "null_resource" "sops_age_secret" {
   depends_on = [null_resource.flux_bootstrap]
 }
 
+# Step 3: Patch kustomize-controller and commit kustomization.yaml
 resource "null_resource" "flux_sops_patch" {
   triggers = {
     cluster_name = var.cluster_name
@@ -98,7 +138,7 @@ KUST
     }
   }
 
-  depends_on = [null_resource.sops_age_secret]
+  depends_on = [null_resource.sops_age_secret_post_bootstrap]
 }
 
 output "age_key_file" {

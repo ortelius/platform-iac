@@ -346,6 +346,7 @@ resource "null_resource" "flux_bootstrap" {
     github_repository_deploy_key.flux_eks,
     local_file.bootstrap_script,
     local_file.pdvd_values,
+    null_resource.sops_age_secret_pre_bootstrap,
   ]
 }
 
