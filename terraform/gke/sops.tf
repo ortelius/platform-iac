@@ -75,7 +75,7 @@ resource "null_resource" "sops_age_secret" {
 
       kubectl create secret generic sops-age \
         --namespace=flux-system \
-        --from-file=age.agekey="$KEY_FILE" \
+        --from-literal=SOPS_AGE_KEY="$(cat $KEY_FILE)" \
         --dry-run=client -o yaml | kubectl apply -f -
 
       echo "sops-age secret applied in flux-system"
