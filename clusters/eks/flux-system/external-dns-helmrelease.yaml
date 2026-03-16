@@ -20,7 +20,7 @@ spec:
     image:
       registry: registry.k8s.io
       repository: external-dns/external-dns
-      tag: latest  
+      tag: v0.20.0
     provider: aws
     aws:
       zoneType: public
