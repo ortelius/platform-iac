@@ -98,8 +98,8 @@ resources:
   - gotk-sync.yaml
   - aws-lbc-helmrepository.yaml
   - aws-lbc-helmrelease.yaml
-  - bitnami-helmrepository.yaml
-  - external-dns-helmrelease.yaml  
+  - external-dns-helmrepository.yaml
+  - external-dns-helmrelease.yaml
 patches:
   - patch: |
       apiVersion: apps/v1

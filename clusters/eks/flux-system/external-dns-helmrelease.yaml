@@ -9,25 +9,21 @@ spec:
   chart:
     spec:
       chart: external-dns
-      version: ">=6.0.0"
+      version: ">=1.14.0"   
       sourceRef:
         kind: HelmRepository
-        name: bitnami
+        name: external-dns   
         namespace: flux-system
   install:
     createNamespace: true
   values:
-    image:
-      registry: registry.k8s.io
-      repository: external-dns/external-dns
-      tag: v0.20.0
-    provider: aws
-    aws:
-      zoneType: public
+    # (Keep your existing provider config here!)
+    # Example if you were using Cloudflare:
+    provider: cloudflare
     txtOwnerId: pdvd-eks
-    serviceAccount:
-      create: true
-      name: external-dns
-      annotations:
-        # Note: If your AWS Account ID/Region differs, grab the exact ARN from your `terraform output`
-        eks.amazonaws.com/role-arn: arn:aws:iam::754991274490:role/pdvd-eks-external-dns
+    env:
+      - name: CF_API_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: pdvd-secrets
+            key: cloudflare.apiToken

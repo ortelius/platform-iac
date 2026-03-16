@@ -223,11 +223,11 @@ data "cloudflare_zone" "this" {
 
 resource "cloudflare_record" "cert_validation" {
   for_each = {
-      for dvo in aws_acm_certificate.app.domain_validation_options : dvo.domain_name => {
-        name   = trimsuffix(dvo.resource_record_name, ".")
-        record = dvo.resource_record_value
-        type   = dvo.resource_record_type
-      } if var.dns_provider == "cloudflare"
+    for dvo in aws_acm_certificate.app.domain_validation_options : dvo.domain_name => {
+      name   = trimsuffix(dvo.resource_record_name, ".")
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    } if var.dns_provider == "cloudflare"
   }
 
   zone_id = data.cloudflare_zone.this[0].id
@@ -244,6 +244,75 @@ resource "aws_acm_certificate_validation" "app" {
   ] : [
     for record in cloudflare_record.cert_validation : record.hostname
   ]
+}
+
+# ── ExternalDNS HelmRelease Generator ─────────────────────────────────────────
+locals {
+  ext_dns_r53 = <<-YAML
+    apiVersion: helm.toolkit.fluxcd.io/v2
+    kind: HelmRelease
+    metadata:
+      name: external-dns
+      namespace: flux-system
+    spec:
+      interval: 5m
+      targetNamespace: kube-system
+      chart:
+        spec:
+          chart: external-dns
+          version: ">=1.14.0"
+          sourceRef:
+            kind: HelmRepository
+            name: external-dns
+            namespace: flux-system
+      install:
+        createNamespace: true
+      values:
+        provider: aws
+        aws:
+          zoneType: public
+        txtOwnerId: ${var.cluster_name}
+        serviceAccount:
+          create: true
+          name: external-dns
+          annotations:
+            eks.amazonaws.com/role-arn: ${try(module.external_dns_irsa_role[0].iam_role_arn, "")}
+  YAML
+
+  ext_dns_cf = <<-YAML
+    apiVersion: helm.toolkit.fluxcd.io/v2
+    kind: HelmRelease
+    metadata:
+      name: external-dns
+      namespace: flux-system
+    spec:
+      interval: 5m
+      targetNamespace: kube-system
+      chart:
+        spec:
+          chart: external-dns
+          version: ">=1.14.0"
+          sourceRef:
+            kind: HelmRepository
+            name: external-dns
+            namespace: flux-system
+      install:
+        createNamespace: true
+      values:
+        provider: cloudflare
+        txtOwnerId: ${var.cluster_name}
+        env:
+          - name: CF_API_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: pdvd-secrets
+                key: cloudflare.apiToken
+  YAML
+}
+
+resource "local_file" "external_dns_helmrelease" {
+  filename = "${path.module}/../../clusters/eks/flux-system/external-dns-helmrelease.yaml"
+  content  = var.dns_provider == "route53" ? local.ext_dns_r53 : local.ext_dns_cf
 }
 
 # ── Flux Bootstrap ────────────────────────────────────────────────────────────
@@ -427,6 +496,7 @@ resource "null_resource" "flux_bootstrap" {
     github_repository_deploy_key.flux_eks,
     local_file.bootstrap_script,
     local_file.pdvd_values,
+    local_file.external_dns_helmrelease,
     null_resource.sops_age_secret_pre_bootstrap,
     module.ebs_csi_irsa_role
   ]
@@ -440,7 +510,6 @@ output "public_subnet_ids"       { value = module.vpc.public_subnets }
 output "alb_controller_role_arn" { value = aws_iam_role.alb_controller.arn }
 output "acm_certificate_arn"     { value = aws_acm_certificate_validation.app.certificate_arn }
 
-# The ExternalDNS IAM role ARN (if using Route 53)
 output "external_dns_role_arn" {
   value = var.dns_provider == "route53" ? module.external_dns_irsa_role[0].iam_role_arn : null
 }
