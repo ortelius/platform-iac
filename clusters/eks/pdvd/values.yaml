@@ -4,16 +4,16 @@ pdvd-frontend:
     enabled: true
     type: alb
     host: eks.deployhub.com
-    certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/82c5b01e-404d-441b-beda-f05597a925bb
-    subnets: "subnet-04fcfe480bb96422d,subnet-048d117813de3bec6"
+    certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/118e0b54-31e7-4a32-b429-bf42a081c83c
+    subnets: "subnet-0889bda0487787ddb,subnet-08aa729bd6e931eda"
 
 pdvd-backend:
   ingress:
     enabled: true
     type: alb
     host: eks.deployhub.com
-    certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/82c5b01e-404d-441b-beda-f05597a925bb
-    subnets: "subnet-04fcfe480bb96422d,subnet-048d117813de3bec6"
+    certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/118e0b54-31e7-4a32-b429-bf42a081c83c
+    subnets: "subnet-0889bda0487787ddb,subnet-08aa729bd6e931eda"
   rbac_repo: https://github.com/ortelius/pdvd-rbac
   apiBaseUrl: https://eks.deployhub.com/api
   github:
