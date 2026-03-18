@@ -29,6 +29,8 @@ spec:
         host: eks.deployhub.com
         certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/bf119c31-1aa2-4270-903a-7b08d1a3a0d8
         subnets: "subnet-0d6b1c5793673a4f8,subnet-09fb2dcb293f6ebcf"
+      graphqlEndpoint: "https://eks.deployhub.com/api/v1/graphql"
+      restapiEndpoint: "https://eks.deployhub.com/api/v1"
 
     pdvd-backend:
       ingress:

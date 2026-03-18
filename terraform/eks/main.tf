@@ -359,6 +359,8 @@ resource "local_file" "pdvd_values" {
         host: ${var.domain}
         certificateArn: ${aws_acm_certificate_validation.app.certificate_arn}
         subnets: "${join(",", module.vpc.public_subnets)}"
+      graphqlEndpoint: "https://${var.domain}/api/v1/graphql"
+      restapiEndpoint: "https://${var.domain}/api/v1"
 
     pdvd-backend:
       ingress:
@@ -412,6 +414,8 @@ resource "local_file" "pdvd_helmrelease" {
             host: ${var.domain}
             certificateArn: ${aws_acm_certificate_validation.app.certificate_arn}
             subnets: "${join(",", module.vpc.public_subnets)}"
+          graphqlEndpoint: "https://${var.domain}/api/v1/graphql"
+          restapiEndpoint: "https://${var.domain}/api/v1"
 
         pdvd-backend:
           ingress:

@@ -114,6 +114,17 @@ YAML
     DNS_PROVIDER=$(grep 'dns_provider' "$WORKDIR/terraform.tfvars" | cut -d'"' -f2 || echo "route53")
 
     if [[ "$DNS_PROVIDER" == "cloudflare" ]]; then
+      # Prefer the env var; fall back to interactive prompt — never allow an empty token
+      CF_TOKEN="${TF_VAR_cloudflare_api_token:-}"
+      if [[ -z "$CF_TOKEN" ]]; then
+        read -rp "  cloudflare.apiToken (required for ExternalDNS): " CF_TOKEN
+      fi
+      if [[ -z "$CF_TOKEN" ]]; then
+        echo "ERROR: Cloudflare API token is required when dns_provider=cloudflare but was not provided."
+        rm "$TMP"
+        exit 1
+      fi
+
       cat >> "$TMP" <<YAML
 ---
 apiVersion: v1
@@ -122,7 +133,7 @@ metadata:
   name: pdvd-secrets
   namespace: kube-system
 stringData:
-  cloudflare.apiToken: "${TF_VAR_cloudflare_api_token:-}"
+  cloudflare.apiToken: "${CF_TOKEN}"
 YAML
     fi
 
