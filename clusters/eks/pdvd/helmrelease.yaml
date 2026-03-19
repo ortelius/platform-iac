@@ -27,8 +27,8 @@ spec:
         enabled: true
         type: alb
         host: eks.deployhub.com
-        certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/72e31841-3112-4ddf-a314-8482d11852b8
-        subnets: "subnet-0d8a12e44235dff95,subnet-03b0934e0bdd05375"
+        certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/6254ff0a-e438-4e6e-9317-5b51a2be547d
+        subnets: "subnet-0d0463149dec8f3c9,subnet-01376a8da6d26478a"
       graphqlEndpoint: "https://eks.deployhub.com/api/v1/graphql"
       restapiEndpoint: "https://eks.deployhub.com/api/v1"
 
@@ -37,8 +37,8 @@ spec:
         enabled: true
         type: alb
         host: eks.deployhub.com
-        certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/72e31841-3112-4ddf-a314-8482d11852b8
-        subnets: "subnet-0d8a12e44235dff95,subnet-03b0934e0bdd05375"
+        certificateArn: arn:aws:acm:us-east-1:754991274490:certificate/6254ff0a-e438-4e6e-9317-5b51a2be547d
+        subnets: "subnet-0d0463149dec8f3c9,subnet-01376a8da6d26478a"
       rbac_repo: https://github.com/ortelius/pdvd-rbac
       apiBaseUrl: https://eks.deployhub.com/api
       github:
