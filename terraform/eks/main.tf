@@ -132,29 +132,10 @@ module "eks" {
   }
 
   eks_managed_node_groups = {
-    # Single-AZ node group for stateful workloads (ArangoDB).
-    # Pinned to private_subnets[0] so EBS volumes always colocate with pods.
-    stateful = {
-      instance_types = ["t4g.medium", "t4g.large", "m6g.medium"]
+    default = {
+      instance_types = ["t4g.medium"]
       ami_type       = "BOTTLEROCKET_ARM_64"
       capacity_type  = "ON_DEMAND"
-      min_size       = 1
-      max_size       = 1
-      desired_size   = 1
-
-      subnet_ids = [module.vpc.private_subnets[0]]
-
-      labels = {
-        workload-type = "stateful"
-      }
-    }
-
-    # Multi-AZ node group for stateless workloads (frontend, backend, controllers).
-    # Spread across both AZs for better Spot availability.
-    stateless = {
-      instance_types = ["t4g.medium", "t4g.large", "m6g.medium"]
-      ami_type       = "BOTTLEROCKET_ARM_64"
-      capacity_type  = "SPOT"
       min_size       = 2
       max_size       = 4
       desired_size   = 2
