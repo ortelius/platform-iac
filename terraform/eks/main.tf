@@ -120,7 +120,7 @@ module "eks" {
 
   # Explicit SG rule management so Terraform revokes cross-references
   # before deleting security groups on destroy — prevents DependencyViolation.
-  create_cluster_security_group        = true
+  create_cluster_security_group           = true
   cluster_security_group_additional_rules = {}
   node_security_group_additional_rules    = {}
 
@@ -316,6 +316,9 @@ locals {
                 name: pdvd-secrets
                 key: cloudflare.apiToken
   YAML
+
+  # VPC ID looked up by name tag for use in the destroy-time SG sweep
+  vpc_name_tag = "${var.cluster_name}-vpc"
 }
 
 resource "local_file" "external_dns_helmrelease" {
@@ -576,6 +579,111 @@ resource "null_resource" "flux_bootstrap" {
   ]
 }
 
+# ── Destroy-time: sweep ALB-controller-owned security groups ──────────────────
+#
+# The ALB controller creates SGs tagged elbv2.k8s.aws/cluster dynamically —
+# they are invisible to Terraform state. If they still exist when the VPC is
+# destroyed, AWS returns DependencyViolation because the SGs hold ENI
+# references and may reference each other via ingress/egress rules.
+#
+# This null_resource runs only on destroy (when=destroy) and:
+#   1. Looks up the VPC by name tag to scope the SG query.
+#   2. For each matching SG, revokes all ingress + egress rules first
+#      (cross-SG rule references block deletion even when both SGs are targets).
+#   3. Deletes each SG.
+#
+# Runs before the VPC module is destroyed (depends_on module.vpc ensures
+# Terraform's destroy ordering keeps this earlier in the graph).
+resource "null_resource" "alb_sg_sweep" {
+  triggers = {
+    cluster_name = var.cluster_name
+    aws_region   = var.aws_region
+    vpc_name_tag = local.vpc_name_tag
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-CMD
+      set +e
+      echo "  Sweeping orphaned ALB controller security groups..."
+
+      VPC_ID=$(aws ec2 describe-vpcs \
+        --region "${self.triggers.aws_region}" \
+        --filters "Name=tag:Name,Values=${self.triggers.vpc_name_tag}" \
+        --query 'Vpcs[0].VpcId' \
+        --output text 2>/dev/null)
+
+      if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+        echo "  VPC not found — skipping SG sweep."
+        exit 0
+      fi
+
+      echo "  VPC: $VPC_ID"
+
+      SG_IDS=$(aws ec2 describe-security-groups \
+        --region "${self.triggers.aws_region}" \
+        --filters \
+          "Name=tag-key,Values=elbv2.k8s.aws/cluster" \
+          "Name=vpc-id,Values=$VPC_ID" \
+        --query 'SecurityGroups[].GroupId' \
+        --output text 2>/dev/null)
+
+      if [[ -z "$SG_IDS" || "$SG_IDS" == "None" ]]; then
+        echo "  No ALB controller SGs found."
+        exit 0
+      fi
+
+      # Pass 1 — revoke all ingress and egress rules so cross-SG references
+      # are cleared before any deletion attempt.
+      for SG_ID in $SG_IDS; do
+        echo "  Revoking rules on $SG_ID..."
+
+        INGRESS=$(aws ec2 describe-security-groups \
+          --region "${self.triggers.aws_region}" \
+          --group-ids "$SG_ID" \
+          --query 'SecurityGroups[0].IpPermissions' \
+          --output json 2>/dev/null)
+        if [[ -n "$INGRESS" && "$INGRESS" != "[]" && "$INGRESS" != "null" ]]; then
+          aws ec2 revoke-security-group-ingress \
+            --region "${self.triggers.aws_region}" \
+            --group-id "$SG_ID" \
+            --ip-permissions "$INGRESS" 2>/dev/null \
+            || echo "    ⚠  Could not revoke ingress on $SG_ID"
+        fi
+
+        EGRESS=$(aws ec2 describe-security-groups \
+          --region "${self.triggers.aws_region}" \
+          --group-ids "$SG_ID" \
+          --query 'SecurityGroups[0].IpPermissionsEgress' \
+          --output json 2>/dev/null)
+        if [[ -n "$EGRESS" && "$EGRESS" != "[]" && "$EGRESS" != "null" ]]; then
+          aws ec2 revoke-security-group-egress \
+            --region "${self.triggers.aws_region}" \
+            --group-id "$SG_ID" \
+            --ip-permissions "$EGRESS" 2>/dev/null \
+            || echo "    ⚠  Could not revoke egress on $SG_ID"
+        fi
+      done
+
+      # Pass 2 — delete each SG now that rules are clear.
+      for SG_ID in $SG_IDS; do
+        echo "  Deleting SG: $SG_ID"
+        aws ec2 delete-security-group \
+          --region "${self.triggers.aws_region}" \
+          --group-id "$SG_ID" 2>/dev/null \
+          || echo "  ⚠  Could not delete $SG_ID — may still have attachments, proceeding."
+      done
+
+      echo "  ✓ ALB SG sweep complete."
+    CMD
+
+    environment = {
+      AWS_DEFAULT_REGION = self.triggers.aws_region
+    }
+  }
+
+  depends_on = [module.vpc]
+}
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
 output "cluster_name"            { value = var.cluster_name }
