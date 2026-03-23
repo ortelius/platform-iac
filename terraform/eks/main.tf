@@ -345,7 +345,7 @@ locals {
                 key: cloudflare.apiToken
   YAML
 
-  # VPC ID looked up by name tag for use in the destroy-time SG sweep
+  # VPC ID looked up by name tag for use in the destroy-time dependency sweep
   vpc_name_tag = "${var.cluster_name}-vpc"
 }
 
@@ -563,22 +563,19 @@ resource "null_resource" "flux_bootstrap" {
   ]
 }
 
-# ── Destroy-time: sweep ALB-controller-owned security groups ──────────────────
+# ── Destroy-time: sweep ALL orphaned VPC dependencies ─────────────────────────
 #
-# The ALB controller creates SGs tagged elbv2.k8s.aws/cluster dynamically —
-# they are invisible to Terraform state. If they still exist when the VPC is
-# destroyed, AWS returns DependencyViolation because the SGs hold ENI
-# references and may reference each other via ingress/egress rules.
+# On destroy, AWS returns DependencyViolation if the VPC still has:
+#   - Orphaned ENIs (from ALBs, Lambda, EKS control plane cross-account links)
+#   - Security groups with cross-SG ingress/egress rules
+#   - Non-default security groups (ALB controller, EKS k8s-traffic-*, extras)
 #
-# This null_resource runs only on destroy (when=destroy) and:
-#   1. Looks up the VPC by name tag to scope the SG query.
-#   2. For each matching SG, revokes all ingress + egress rules first
-#      (cross-SG rule references block deletion even when both SGs are targets).
-#   3. Deletes each SG.
+# This sweep runs three passes:
+#   1. Detach and delete all orphaned ENIs in the VPC
+#   2. Revoke all ingress/egress rules on every non-default SG
+#   3. Delete every non-default SG with retries (ENI detach is async)
 #
-# Runs before the VPC module is destroyed (depends_on module.vpc ensures
-# Terraform's destroy ordering keeps this earlier in the graph).
-resource "null_resource" "alb_sg_sweep" {
+resource "null_resource" "vpc_dependency_sweep" {
   triggers = {
     cluster_name = var.cluster_name
     aws_region   = var.aws_region
@@ -586,80 +583,160 @@ resource "null_resource" "alb_sg_sweep" {
   }
 
   provisioner "local-exec" {
-    when       = destroy
+    when        = destroy
     interpreter = ["/bin/bash", "-c"]
     command = <<-CMD
       set +e
-      echo "  Sweeping orphaned ALB controller security groups..."
+      REGION="${self.triggers.aws_region}"
+      echo ""
+      echo "════════ Destroy-time VPC dependency sweep ════════"
 
       VPC_ID=$(aws ec2 describe-vpcs \
-        --region "${self.triggers.aws_region}" \
+        --region "$REGION" \
         --filters "Name=tag:Name,Values=${self.triggers.vpc_name_tag}" \
         --query 'Vpcs[0].VpcId' \
         --output text 2>/dev/null)
 
       if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-        echo "  VPC not found — skipping SG sweep."
+        echo "  VPC not found — nothing to sweep."
         exit 0
       fi
-
       echo "  VPC: $VPC_ID"
 
-      SG_IDS=$(aws ec2 describe-security-groups \
-        --region "${self.triggers.aws_region}" \
-        --filters \
-          "Name=tag-key,Values=elbv2.k8s.aws/cluster" \
-          "Name=vpc-id,Values=$VPC_ID" \
-        --query 'SecurityGroups[].GroupId' \
+      # ── Pass 1: Detach & delete orphaned ENIs ──────────────────────────────
+      echo ""
+      echo "  ── Pass 1: ENI cleanup ──"
+      ENI_IDS=$(aws ec2 describe-network-interfaces \
+        --region "$REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query 'NetworkInterfaces[].NetworkInterfaceId' \
         --output text 2>/dev/null)
 
-      if [ -z "$SG_IDS" ] || [ "$SG_IDS" = "None" ]; then
-        echo "  No ALB controller SGs found."
-        exit 0
+      if [ -n "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
+        for ENI_ID in $ENI_IDS; do
+          ATTACH_ID=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+            --output text 2>/dev/null)
+          ATTACH_STATUS=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Attachment.Status' \
+            --output text 2>/dev/null)
+
+          if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_STATUS" = "attached" ]; then
+            echo "    Detaching $ENI_ID (attachment: $ATTACH_ID)..."
+            aws ec2 detach-network-interface \
+              --region "$REGION" \
+              --attachment-id "$ATTACH_ID" \
+              --force 2>/dev/null \
+              || echo "      ⚠  Could not detach $ENI_ID"
+          fi
+        done
+
+        echo "    Waiting 15s for ENI detachments to settle..."
+        sleep 15
+
+        # Delete ENIs that are now available
+        for ENI_ID in $ENI_IDS; do
+          STATUS=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Status' \
+            --output text 2>/dev/null)
+          if [ "$STATUS" = "available" ]; then
+            echo "    Deleting $ENI_ID..."
+            aws ec2 delete-network-interface \
+              --region "$REGION" \
+              --network-interface-id "$ENI_ID" 2>/dev/null \
+              || echo "      ⚠  Could not delete $ENI_ID"
+          else
+            echo "    Skipping $ENI_ID (status: $STATUS)"
+          fi
+        done
+      else
+        echo "    No ENIs found."
       fi
 
-      # Pass 1 — revoke all ingress and egress rules so cross-SG references
-      # are cleared before any deletion attempt.
-      for SG_ID in $SG_IDS; do
-        echo "  Revoking rules on $SG_ID..."
+      # ── Pass 2: Revoke all SG rules (clears cross-SG references) ──────────
+      echo ""
+      echo "  ── Pass 2: Revoke SG rules ──"
+      ALL_SGS=$(aws ec2 describe-security-groups \
+        --region "$REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+        --output text 2>/dev/null)
 
-        INGRESS=$(aws ec2 describe-security-groups \
-          --region "${self.triggers.aws_region}" \
-          --group-ids "$SG_ID" \
-          --query 'SecurityGroups[0].IpPermissions' \
-          --output json 2>/dev/null)
-        if [ -n "$INGRESS" ] && [ "$INGRESS" != "[]" ] && [ "$INGRESS" != "null" ]; then
-          aws ec2 revoke-security-group-ingress \
-            --region "${self.triggers.aws_region}" \
-            --group-id "$SG_ID" \
-            --ip-permissions "$INGRESS" 2>/dev/null \
-            || echo "    ⚠  Could not revoke ingress on $SG_ID"
+      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
+        for SG_ID in $ALL_SGS; do
+          echo "    Revoking rules on $SG_ID..."
+          INGRESS=$(aws ec2 describe-security-groups \
+            --region "$REGION" \
+            --group-ids "$SG_ID" \
+            --query 'SecurityGroups[0].IpPermissions' \
+            --output json 2>/dev/null)
+          if [ -n "$INGRESS" ] && [ "$INGRESS" != "[]" ] && [ "$INGRESS" != "null" ]; then
+            aws ec2 revoke-security-group-ingress \
+              --region "$REGION" \
+              --group-id "$SG_ID" \
+              --ip-permissions "$INGRESS" 2>/dev/null \
+              || echo "      ⚠  Could not revoke ingress on $SG_ID"
+          fi
+
+          EGRESS=$(aws ec2 describe-security-groups \
+            --region "$REGION" \
+            --group-ids "$SG_ID" \
+            --query 'SecurityGroups[0].IpPermissionsEgress' \
+            --output json 2>/dev/null)
+          if [ -n "$EGRESS" ] && [ "$EGRESS" != "[]" ] && [ "$EGRESS" != "null" ]; then
+            aws ec2 revoke-security-group-egress \
+              --region "$REGION" \
+              --group-id "$SG_ID" \
+              --ip-permissions "$EGRESS" 2>/dev/null \
+              || echo "      ⚠  Could not revoke egress on $SG_ID"
+          fi
+        done
+      else
+        echo "    No non-default SGs found."
+      fi
+
+      # ── Pass 3: Delete all non-default SGs (with retry) ───────────────────
+      echo ""
+      echo "  ── Pass 3: Delete SGs ──"
+      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
+        MAX_ATTEMPTS=5
+        ATTEMPT=1
+        REMAINING="$ALL_SGS"
+
+        while [ -n "$REMAINING" ] && [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+          STILL_REMAINING=""
+          for SG_ID in $REMAINING; do
+            aws ec2 delete-security-group \
+              --region "$REGION" \
+              --group-id "$SG_ID" 2>/dev/null
+            if [ $? -ne 0 ]; then
+              STILL_REMAINING="$STILL_REMAINING $SG_ID"
+            else
+              echo "    ✓ Deleted $SG_ID"
+            fi
+          done
+          REMAINING=$(echo "$STILL_REMAINING" | xargs)
+          if [ -n "$REMAINING" ]; then
+            echo "    Attempt $ATTEMPT/$MAX_ATTEMPTS: $(echo $REMAINING | wc -w | tr -d ' ') SGs remaining — retrying in 15s..."
+            sleep 15
+          fi
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+
+        if [ -n "$REMAINING" ]; then
+          echo "    ⚠  Could not delete: $REMAINING"
+          echo "       These may need manual removal before VPC can be deleted."
         fi
+      fi
 
-        EGRESS=$(aws ec2 describe-security-groups \
-          --region "${self.triggers.aws_region}" \
-          --group-ids "$SG_ID" \
-          --query 'SecurityGroups[0].IpPermissionsEgress' \
-          --output json 2>/dev/null)
-        if [ -n "$EGRESS" ] && [ "$EGRESS" != "[]" ] && [ "$EGRESS" != "null" ]; then
-          aws ec2 revoke-security-group-egress \
-            --region "${self.triggers.aws_region}" \
-            --group-id "$SG_ID" \
-            --ip-permissions "$EGRESS" 2>/dev/null \
-            || echo "    ⚠  Could not revoke egress on $SG_ID"
-        fi
-      done
-
-      # Pass 2 — delete each SG now that rules are clear.
-      for SG_ID in $SG_IDS; do
-        echo "  Deleting SG: $SG_ID"
-        aws ec2 delete-security-group \
-          --region "${self.triggers.aws_region}" \
-          --group-id "$SG_ID" 2>/dev/null \
-          || echo "  ⚠  Could not delete $SG_ID — may still have attachments, proceeding."
-      done
-
-      echo "  ✓ ALB SG sweep complete."
+      echo ""
+      echo "  ✓ VPC dependency sweep complete."
     CMD
 
     environment = {
