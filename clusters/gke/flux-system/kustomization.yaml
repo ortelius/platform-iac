@@ -1,18 +1,24 @@
+---
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- gotk-components.yaml
-- gotk-sync.yaml
-
+  - gotk-components.yaml
+  - gotk-sync.yaml
 patches:
   - patch: |
-      apiVersion: v1
-      kind: ServiceAccount
+      apiVersion: apps/v1
+      kind: Deployment
       metadata:
         name: kustomize-controller
         namespace: flux-system
-        annotations:
-          iam.gke.io/gcp-service-account: flux-sops@eighth-physics-169321.iam.gserviceaccount.com
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                envFrom:
+                  - secretRef:
+                      name: sops-age
     target:
-      kind: ServiceAccount
+      kind: Deployment
       name: kustomize-controller
