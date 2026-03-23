@@ -61,6 +61,185 @@ provider "cloudflare" {
   api_token = var.cloudflare_api_token
 }
 
+# ── Destroy-time: sweep orphaned VPC dependencies ─────────────────────────────
+#
+# In the destroy graph (reverse of create):
+#   1. module.eks is destroyed first
+#   2. This resource is destroyed — the when=destroy provisioner sweeps orphans
+#   3. module.vpc is destroyed (clean, no DependencyViolation)
+#
+resource "terraform_data" "vpc_dependency_sweep" {
+  input = module.vpc.vpc_id
+
+  triggers_replace = {
+    cluster_name = var.cluster_name
+    aws_region   = var.aws_region
+    vpc_name_tag = "${var.cluster_name}-vpc"
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-CMD
+      set +e
+      REGION="${self.triggers_replace.aws_region}"
+      VPC_NAME="${self.triggers_replace.vpc_name_tag}"
+      echo ""
+      echo "════════ Destroy-time VPC dependency sweep ════════"
+
+      VPC_ID=$(aws ec2 describe-vpcs \
+        --region "$REGION" \
+        --filters "Name=tag:Name,Values=$VPC_NAME" \
+        --query 'Vpcs[0].VpcId' \
+        --output text 2>/dev/null)
+
+      if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+        echo "  VPC not found — nothing to sweep."
+        exit 0
+      fi
+      echo "  VPC: $VPC_ID"
+
+      # ── Pass 1: Detach & delete orphaned ENIs ──────────────────────────────
+      echo ""
+      echo "  ── Pass 1: ENI cleanup ──"
+      ENI_IDS=$(aws ec2 describe-network-interfaces \
+        --region "$REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query 'NetworkInterfaces[].NetworkInterfaceId' \
+        --output text 2>/dev/null)
+
+      if [ -n "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
+        for ENI_ID in $ENI_IDS; do
+          ATTACH_ID=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+            --output text 2>/dev/null)
+          ATTACH_STATUS=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Attachment.Status' \
+            --output text 2>/dev/null)
+
+          if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_STATUS" = "attached" ]; then
+            echo "    Detaching $ENI_ID (attachment: $ATTACH_ID)..."
+            aws ec2 detach-network-interface \
+              --region "$REGION" \
+              --attachment-id "$ATTACH_ID" \
+              --force 2>/dev/null \
+              || echo "      ⚠  Could not detach $ENI_ID"
+          fi
+        done
+
+        echo "    Waiting 20s for ENI detachments to settle..."
+        sleep 20
+
+        for ENI_ID in $ENI_IDS; do
+          STATUS=$(aws ec2 describe-network-interfaces \
+            --region "$REGION" \
+            --network-interface-ids "$ENI_ID" \
+            --query 'NetworkInterfaces[0].Status' \
+            --output text 2>/dev/null)
+          if [ "$STATUS" = "available" ]; then
+            echo "    Deleting $ENI_ID..."
+            aws ec2 delete-network-interface \
+              --region "$REGION" \
+              --network-interface-id "$ENI_ID" 2>/dev/null \
+              || echo "      ⚠  Could not delete $ENI_ID"
+          elif [ -n "$STATUS" ] && [ "$STATUS" != "None" ]; then
+            echo "    Skipping $ENI_ID (status: $STATUS)"
+          fi
+        done
+      else
+        echo "    No ENIs found."
+      fi
+
+      # ── Pass 2: Revoke all SG rules (clears cross-SG references) ──────────
+      echo ""
+      echo "  ── Pass 2: Revoke SG rules ──"
+      ALL_SGS=$(aws ec2 describe-security-groups \
+        --region "$REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+        --output text 2>/dev/null)
+
+      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
+        for SG_ID in $ALL_SGS; do
+          echo "    Revoking rules on $SG_ID..."
+          INGRESS=$(aws ec2 describe-security-groups \
+            --region "$REGION" \
+            --group-ids "$SG_ID" \
+            --query 'SecurityGroups[0].IpPermissions' \
+            --output json 2>/dev/null)
+          if [ -n "$INGRESS" ] && [ "$INGRESS" != "[]" ] && [ "$INGRESS" != "null" ]; then
+            aws ec2 revoke-security-group-ingress \
+              --region "$REGION" \
+              --group-id "$SG_ID" \
+              --ip-permissions "$INGRESS" 2>/dev/null \
+              || echo "      ⚠  Could not revoke ingress on $SG_ID"
+          fi
+
+          EGRESS=$(aws ec2 describe-security-groups \
+            --region "$REGION" \
+            --group-ids "$SG_ID" \
+            --query 'SecurityGroups[0].IpPermissionsEgress' \
+            --output json 2>/dev/null)
+          if [ -n "$EGRESS" ] && [ "$EGRESS" != "[]" ] && [ "$EGRESS" != "null" ]; then
+            aws ec2 revoke-security-group-egress \
+              --region "$REGION" \
+              --group-id "$SG_ID" \
+              --ip-permissions "$EGRESS" 2>/dev/null \
+              || echo "      ⚠  Could not revoke egress on $SG_ID"
+          fi
+        done
+      else
+        echo "    No non-default SGs found."
+      fi
+
+      # ── Pass 3: Delete all non-default SGs (with retry) ───────────────────
+      echo ""
+      echo "  ── Pass 3: Delete SGs ──"
+      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
+        MAX_ATTEMPTS=5
+        ATTEMPT=1
+        REMAINING="$ALL_SGS"
+
+        while [ -n "$REMAINING" ] && [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+          STILL_REMAINING=""
+          for SG_ID in $REMAINING; do
+            aws ec2 delete-security-group \
+              --region "$REGION" \
+              --group-id "$SG_ID" 2>/dev/null
+            if [ $? -ne 0 ]; then
+              STILL_REMAINING="$STILL_REMAINING $SG_ID"
+            else
+              echo "    ✓ Deleted $SG_ID"
+            fi
+          done
+          REMAINING=$(echo "$STILL_REMAINING" | xargs)
+          if [ -n "$REMAINING" ]; then
+            echo "    Attempt $ATTEMPT/$MAX_ATTEMPTS: $(echo $REMAINING | wc -w | tr -d ' ') SGs remaining — retrying in 15s..."
+            sleep 15
+          fi
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+
+        if [ -n "$REMAINING" ]; then
+          echo "    ⚠  Could not delete: $REMAINING"
+          echo "       These may need manual removal before VPC can be deleted."
+        fi
+      fi
+
+      echo ""
+      echo "  ✓ VPC dependency sweep complete."
+    CMD
+
+    environment = {
+      AWS_DEFAULT_REGION = self.triggers_replace.aws_region
+    }
+  }
+}
+
 # ── VPC ───────────────────────────────────────────────────────────────────────
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -143,9 +322,6 @@ module "eks" {
       subnet_ids = module.vpc.private_subnets
     }
 
-    # Single-AZ node group guarantees at least one node in us-east-1a
-    # so ArangoDB (pinned via nodeSelector) always has somewhere to schedule
-    # and its Retain PV is always in the same AZ as the node.
     stateful = {
       instance_types = ["t4g.medium"]
       ami_type       = "BOTTLEROCKET_ARM_64"
@@ -161,6 +337,9 @@ module "eks" {
       }
     }
   }
+
+  # Dependency inversion to force EKS to be destroyed before the sweep resource
+  depends_on = [terraform_data.vpc_dependency_sweep]
 }
 
 # ── IAM: AWS Load Balancer Controller ─────────────────────────────────────────
@@ -344,9 +523,6 @@ locals {
                 name: pdvd-secrets
                 key: cloudflare.apiToken
   YAML
-
-  # VPC ID looked up by name tag for use in the destroy-time dependency sweep
-  vpc_name_tag = "${var.cluster_name}-vpc"
 }
 
 resource "local_file" "external_dns_helmrelease" {
@@ -381,19 +557,9 @@ resource "null_resource" "git_pull" {
   }
 }
 
-# ── pdvd values.yaml — non-sensitive fields only ──────────────────────────────
-# Sensitive fields (baseUrl, github.appId, github.clientId, github.clientSecret,
-# github.privateKey, rbac_repo_token, smtp.*) are injected via valuesFrom in
-# the HelmRelease referencing the SOPS-decrypted pdvd-secrets Secret.
-# NOTE: clusters/eks/pdvd/pdvd-helmrelease.yaml is the canonical HelmRelease.
-#       This resource only writes values.yaml — helmrelease.yaml is NOT generated
-#       to avoid a duplicate HelmRelease conflict with pdvd-helmrelease.yaml.
 resource "local_file" "pdvd_values" {
   filename = "${path.module}/../../clusters/eks/pdvd/values.yaml"
   content  = <<-YAML
-    # Auto-generated by Terraform — non-sensitive values only.
-    # Sensitive values are merged at runtime from the pdvd-secrets SOPS secret
-    # via valuesFrom in clusters/eks/pdvd/pdvd-helmrelease.yaml.
     pdvd-arangodb:
       cloudProvider: "eks"
       nodeSelector:
@@ -558,199 +724,8 @@ resource "null_resource" "flux_bootstrap" {
     local_file.bootstrap_script,
     local_file.pdvd_values,
     local_file.external_dns_helmrelease,
-    null_resource.sops_age_secret_pre_bootstrap,
     module.ebs_csi_irsa_role
   ]
-}
-
-# ── Destroy-time: sweep ALL orphaned VPC dependencies ─────────────────────────
-#
-# On destroy, AWS returns DependencyViolation if the VPC still has:
-#   - Orphaned ENIs (from ALBs, Lambda, EKS control plane cross-account links)
-#   - Security groups with cross-SG ingress/egress rules
-#   - Non-default security groups (ALB controller, EKS k8s-traffic-*, extras)
-#
-# This sweep runs three passes:
-#   1. Detach and delete all orphaned ENIs in the VPC
-#   2. Revoke all ingress/egress rules on every non-default SG
-#   3. Delete every non-default SG with retries (ENI detach is async)
-#
-resource "null_resource" "vpc_dependency_sweep" {
-  triggers = {
-    cluster_name = var.cluster_name
-    aws_region   = var.aws_region
-    vpc_name_tag = local.vpc_name_tag
-  }
-
-  provisioner "local-exec" {
-    when        = destroy
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-CMD
-      set +e
-      REGION="${self.triggers.aws_region}"
-      echo ""
-      echo "════════ Destroy-time VPC dependency sweep ════════"
-
-      VPC_ID=$(aws ec2 describe-vpcs \
-        --region "$REGION" \
-        --filters "Name=tag:Name,Values=${self.triggers.vpc_name_tag}" \
-        --query 'Vpcs[0].VpcId' \
-        --output text 2>/dev/null)
-
-      if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-        echo "  VPC not found — nothing to sweep."
-        exit 0
-      fi
-      echo "  VPC: $VPC_ID"
-
-      # ── Pass 1: Detach & delete orphaned ENIs ──────────────────────────────
-      echo ""
-      echo "  ── Pass 1: ENI cleanup ──"
-      ENI_IDS=$(aws ec2 describe-network-interfaces \
-        --region "$REGION" \
-        --filters "Name=vpc-id,Values=$VPC_ID" \
-        --query 'NetworkInterfaces[].NetworkInterfaceId' \
-        --output text 2>/dev/null)
-
-      if [ -n "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
-        for ENI_ID in $ENI_IDS; do
-          ATTACH_ID=$(aws ec2 describe-network-interfaces \
-            --region "$REGION" \
-            --network-interface-ids "$ENI_ID" \
-            --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
-            --output text 2>/dev/null)
-          ATTACH_STATUS=$(aws ec2 describe-network-interfaces \
-            --region "$REGION" \
-            --network-interface-ids "$ENI_ID" \
-            --query 'NetworkInterfaces[0].Attachment.Status' \
-            --output text 2>/dev/null)
-
-          if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_STATUS" = "attached" ]; then
-            echo "    Detaching $ENI_ID (attachment: $ATTACH_ID)..."
-            aws ec2 detach-network-interface \
-              --region "$REGION" \
-              --attachment-id "$ATTACH_ID" \
-              --force 2>/dev/null \
-              || echo "      ⚠  Could not detach $ENI_ID"
-          fi
-        done
-
-        echo "    Waiting 15s for ENI detachments to settle..."
-        sleep 15
-
-        # Delete ENIs that are now available
-        for ENI_ID in $ENI_IDS; do
-          STATUS=$(aws ec2 describe-network-interfaces \
-            --region "$REGION" \
-            --network-interface-ids "$ENI_ID" \
-            --query 'NetworkInterfaces[0].Status' \
-            --output text 2>/dev/null)
-          if [ "$STATUS" = "available" ]; then
-            echo "    Deleting $ENI_ID..."
-            aws ec2 delete-network-interface \
-              --region "$REGION" \
-              --network-interface-id "$ENI_ID" 2>/dev/null \
-              || echo "      ⚠  Could not delete $ENI_ID"
-          else
-            echo "    Skipping $ENI_ID (status: $STATUS)"
-          fi
-        done
-      else
-        echo "    No ENIs found."
-      fi
-
-      # ── Pass 2: Revoke all SG rules (clears cross-SG references) ──────────
-      echo ""
-      echo "  ── Pass 2: Revoke SG rules ──"
-      ALL_SGS=$(aws ec2 describe-security-groups \
-        --region "$REGION" \
-        --filters "Name=vpc-id,Values=$VPC_ID" \
-        --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
-        --output text 2>/dev/null)
-
-      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
-        for SG_ID in $ALL_SGS; do
-          echo "    Revoking rules on $SG_ID..."
-          INGRESS=$(aws ec2 describe-security-groups \
-            --region "$REGION" \
-            --group-ids "$SG_ID" \
-            --query 'SecurityGroups[0].IpPermissions' \
-            --output json 2>/dev/null)
-          if [ -n "$INGRESS" ] && [ "$INGRESS" != "[]" ] && [ "$INGRESS" != "null" ]; then
-            aws ec2 revoke-security-group-ingress \
-              --region "$REGION" \
-              --group-id "$SG_ID" \
-              --ip-permissions "$INGRESS" 2>/dev/null \
-              || echo "      ⚠  Could not revoke ingress on $SG_ID"
-          fi
-
-          EGRESS=$(aws ec2 describe-security-groups \
-            --region "$REGION" \
-            --group-ids "$SG_ID" \
-            --query 'SecurityGroups[0].IpPermissionsEgress' \
-            --output json 2>/dev/null)
-          if [ -n "$EGRESS" ] && [ "$EGRESS" != "[]" ] && [ "$EGRESS" != "null" ]; then
-            aws ec2 revoke-security-group-egress \
-              --region "$REGION" \
-              --group-id "$SG_ID" \
-              --ip-permissions "$EGRESS" 2>/dev/null \
-              || echo "      ⚠  Could not revoke egress on $SG_ID"
-          fi
-        done
-      else
-        echo "    No non-default SGs found."
-      fi
-
-      # ── Pass 3: Delete all non-default SGs (with retry) ───────────────────
-      echo ""
-      echo "  ── Pass 3: Delete SGs ──"
-      if [ -n "$ALL_SGS" ] && [ "$ALL_SGS" != "None" ]; then
-        MAX_ATTEMPTS=5
-        ATTEMPT=1
-        REMAINING="$ALL_SGS"
-
-        while [ -n "$REMAINING" ] && [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-          STILL_REMAINING=""
-          for SG_ID in $REMAINING; do
-            aws ec2 delete-security-group \
-              --region "$REGION" \
-              --group-id "$SG_ID" 2>/dev/null
-            if [ $? -ne 0 ]; then
-              STILL_REMAINING="$STILL_REMAINING $SG_ID"
-            else
-              echo "    ✓ Deleted $SG_ID"
-            fi
-          done
-          REMAINING=$(echo "$STILL_REMAINING" | xargs)
-          if [ -n "$REMAINING" ]; then
-            echo "    Attempt $ATTEMPT/$MAX_ATTEMPTS: $(echo $REMAINING | wc -w | tr -d ' ') SGs remaining — retrying in 15s..."
-            sleep 15
-          fi
-          ATTEMPT=$((ATTEMPT + 1))
-        done
-
-        if [ -n "$REMAINING" ]; then
-          echo "    ⚠  Could not delete: $REMAINING"
-          echo "       These may need manual removal before VPC can be deleted."
-        fi
-      fi
-
-      echo ""
-      echo "  ✓ VPC dependency sweep complete."
-    CMD
-
-    environment = {
-      AWS_DEFAULT_REGION = self.triggers.aws_region
-    }
-  }
-
-  # Destroy ordering: this depends on module.eks so that in the reverse
-  # (destroy) graph the sweep runs AFTER EKS is fully torn down but
-  # BEFORE the VPC module is destroyed.  By the time the sweep fires,
-  # EKS has already released most ENIs and SGs — the sweep only needs
-  # to mop up true orphans (ALB controller SGs, k8s-traffic-* SGs,
-  # stale ENIs) that would otherwise block VPC deletion.
-  depends_on = [module.eks]
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────────────

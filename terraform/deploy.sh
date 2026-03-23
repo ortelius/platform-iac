@@ -163,25 +163,6 @@ YAML
   fi
 }
 
-# ── Pre-destroy: use Flux to cleanly delete all workloads ─────────────────────
-#
-# Sequence:
-#   1. Verify the cluster exists and its API server is reachable.
-#   2. Verify Flux is installed — skip gracefully if not.
-#   3. Suspend all Kustomizations — stops Flux re-creating things as we delete.
-#   4. Delete infrastructure HelmReleases first (ALB controller, external-dns,
-#      ingress controllers). Helm runs each chart's uninstall hooks, which fire
-#      the controller finalizers that remove ALBs/NLBs/GLBs from the cloud.
-#   5. Delete remaining HelmReleases (app workloads).
-#   6. Poll until all cloud load balancers are gone — terraform destroy will
-#      fail trying to delete the VPC/subnets if any LBs still hold ENIs.
-#   7. flux uninstall — removes all Flux CRDs, controllers, and flux-system.
-#      Terraform then has a completely clean cluster to tear down.
-#
-# The entire function runs with errexit disabled (set +e) so that any individual
-# step failure — a missing resource, a timed-out API call, a partial Flux
-# install — is reported and skipped rather than aborting the whole destroy.
-# errexit is restored before returning so the rest of the script stays strict.
 drain_flux_workloads() {
   echo ""
   echo "════════ Pre-destroy: draining Flux workloads ($CLUSTER_NAME) ════════"
@@ -275,31 +256,29 @@ drain_flux_workloads() {
   fi
 
   # ── 4. Suspend all Kustomizations ───────────────────────────────────────────
-  # Stops Flux from reconciling (re-creating resources) while we delete them.
   echo "  Suspending all Kustomizations..."
   flux suspend kustomization --all --namespace flux-system 2>/dev/null
   [[ $? -ne 0 ]] && echo "  ⚠  Could not suspend Kustomizations (may already be suspended or missing)."
 
-  # ── 5. Force-delete ALBs by querying Ingress hostnames then deleting via AWS CLI ──
-  # The ALB controller may not clean up in time (or at all) after helm uninstall.
-  # Instead: read every Ingress hostname from the cluster, resolve it to an ALB ARN,
-  # and delete it directly. Then do the same for any remaining k8s-prefixed ALBs.
   if [[ "$CLUSTER" == "eks" ]]; then
     echo ""
     echo "  Force-deleting ALBs via AWS CLI..."
 
-    # Collect ALB hostnames from all Ingress objects while the API is still up
     local HOSTNAMES
-    HOSTNAMES=$(kubectl get ingress --all-namespaces --no-headers       -o custom-columns="HOST:.status.loadBalancer.ingress[0].hostname" 2>/dev/null       | grep -v '<none>' | grep -v '^$' || true)
+    HOSTNAMES=$(kubectl get ingress --all-namespaces --no-headers \
+      -o custom-columns="HOST:.status.loadBalancer.ingress[0].hostname" 2>/dev/null \
+      | grep -v '<none>' | grep -v '^$' || true)
 
     if [[ -n "$HOSTNAMES" ]]; then
       while IFS= read -r HOSTNAME; do
         [[ -z "$HOSTNAME" ]] && continue
-        # Extract the ALB name from the hostname (first segment before the first dot)
         local ALB_NAME
         ALB_NAME=$(echo "$HOSTNAME" | cut -d'-' -f1-4)
         local ARN
-        ARN=$(aws elbv2 describe-load-balancers           --region "$AWS_REGION"           --query "LoadBalancers[?contains(DNSName, '${ALB_NAME}')].LoadBalancerArn"           --output text 2>/dev/null)
+        ARN=$(aws elbv2 describe-load-balancers \
+          --region "$AWS_REGION" \
+          --query "LoadBalancers[?contains(DNSName, '${ALB_NAME}')].LoadBalancerArn" \
+          --output text 2>/dev/null)
         if [[ -n "$ARN" && "$ARN" != "None" ]]; then
           echo "    Deleting ALB: $ARN"
           aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" --region "$AWS_REGION" 2>/dev/null
@@ -308,9 +287,11 @@ drain_flux_workloads() {
       done <<< "$HOSTNAMES"
     fi
 
-    # Also sweep any remaining k8s-prefixed ALBs that may not have an Ingress anymore
     local REMAINING_ARNS
-    REMAINING_ARNS=$(aws elbv2 describe-load-balancers       --region "$AWS_REGION"       --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-')].LoadBalancerArn"       --output text 2>/dev/null)
+    REMAINING_ARNS=$(aws elbv2 describe-load-balancers \
+      --region "$AWS_REGION" \
+      --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-')].LoadBalancerArn" \
+      --output text 2>/dev/null)
     if [[ -n "$REMAINING_ARNS" && "$REMAINING_ARNS" != "None" ]]; then
       for ARN in $REMAINING_ARNS; do
         echo "    Deleting remaining ALB: $ARN"
@@ -319,12 +300,14 @@ drain_flux_workloads() {
       done
     fi
 
-    # Wait for all ALBs to finish deleting (they go async)
     echo "  Waiting for ALB deletions to complete..."
     local MAX_WAIT=120 INTERVAL=10 ELAPSED=0
     while true; do
       local TOTAL
-      TOTAL=$(aws elbv2 describe-load-balancers         --region "$AWS_REGION"         --query "length(LoadBalancers[?contains(LoadBalancerName, 'k8s-')])"         --output text 2>/dev/null)
+      TOTAL=$(aws elbv2 describe-load-balancers \
+        --region "$AWS_REGION" \
+        --query "length(LoadBalancers[?contains(LoadBalancerName, 'k8s-')])" \
+        --output text 2>/dev/null)
       [[ -z "$TOTAL" || "$TOTAL" == "None" ]] && TOTAL=0
       [[ "$TOTAL" -eq 0 ]] && { echo "  ✓ All ALBs deleted."; break; }
       if [[ "$ELAPSED" -ge "$MAX_WAIT" ]]; then
@@ -337,7 +320,10 @@ drain_flux_workloads() {
     done
 
   elif [[ "$CLUSTER" == "gke" ]]; then
-    TOTAL=$(gcloud compute forwarding-rules list       --project "$GCP_PROJECT"       --filter "description~$CLUSTER_NAME"       --format "value(name)" 2>/dev/null | wc -l | tr -d ' ')
+    TOTAL=$(gcloud compute forwarding-rules list \
+      --project "$GCP_PROJECT" \
+      --filter "description~$CLUSTER_NAME" \
+      --format "value(name)" 2>/dev/null | wc -l | tr -d ' ')
     [[ -z "$TOTAL" ]] && TOTAL=0
     if [[ "$TOTAL" -gt 0 ]]; then
       echo "  ⚠  ${TOTAL} GCP forwarding rule(s) still present — remove manually if terraform destroy fails."
@@ -349,7 +335,6 @@ drain_flux_workloads() {
   echo "  ✓ Flux workloads fully drained. Proceeding to terraform destroy."
   echo ""
 
-  # Restore strict error handling for the rest of the script
   set -e
 }
 
@@ -390,7 +375,12 @@ case "$ACTION" in
     drain_flux_workloads
 
     [[ -f "sops.tf" ]] && sed -i.bak 's/prevent_destroy = true/prevent_destroy = false/' sops.tf || true
+
+    echo ""
+    echo "════════ Destroying infrastructure ════════"
     terraform destroy -auto-approve
+    echo "✓ Destroy completed successfully."
+
     [[ -f "sops.tf.bak" ]] && mv sops.tf.bak sops.tf || true
     ;;
   *) usage ;;
