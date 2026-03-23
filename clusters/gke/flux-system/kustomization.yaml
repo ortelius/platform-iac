@@ -1,4 +1,3 @@
----
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -16,9 +15,12 @@ patches:
           spec:
             containers:
               - name: manager
-                envFrom:
-                  - secretRef:
-                      name: sops-age
+                env:
+                  - name: SOPS_AGE_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: sops-age
+                        key: age.agekey
     target:
       kind: Deployment
       name: kustomize-controller
