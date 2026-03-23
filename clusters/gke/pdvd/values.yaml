@@ -24,13 +24,13 @@ pdvd-backend:
     appName: "deployhub"
     appId: "2727141"
     clientId: "Iv23liKdUQ34YPWnFfvu"
+  smtp:
+    enabled: true
+    host: "smtp.gmail.com"
+    port: "587"
+    fromEmail: "steve@deployhub.com"
+    fromName: "Steve Taylor"
+    # username and password come from secrets.enc.yaml
 
 pdvd-arangodb: {}   # password comes from secrets.enc.yaml
 
-smtp:
-  enabled: true
-  host: "smtp.gmail.com"
-  port: "587"
-  fromEmail: "steve@deployhub.com"
-  fromName: "Steve Taylor"
-  # username and password come from secrets.enc.yaml
