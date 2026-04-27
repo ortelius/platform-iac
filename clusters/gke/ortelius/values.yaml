@@ -12,7 +12,7 @@ frontend:
     type: glb
     host: "app.deployhub.com"
 
-prtelius:
+ortelius:
   ingress:
     type: glb
     host: "app.deployhub.com"
