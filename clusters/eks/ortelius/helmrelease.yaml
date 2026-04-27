@@ -22,7 +22,7 @@ spec:
       version: ">=12.0.0"
       sourceRef:
         kind: HelmRepository
-        name: parent-charts
+        name: helmcharts
         namespace: flux-system
       interval: 5m
   valuesFrom:
