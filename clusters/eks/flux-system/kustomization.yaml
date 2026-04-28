@@ -10,23 +10,6 @@ resources:
   - external-dns-helmrelease.yaml
 patches:
   - patch: |
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: kustomize-controller
-        namespace: flux-system
-      spec:
-        template:
-          spec:
-            containers:
-              - name: manager
-                envFrom:
-                  - secretRef:
-                      name: sops-age
-    target:
-      kind: Deployment
-      name: kustomize-controller
-  - patch: |
       apiVersion: kustomize.toolkit.fluxcd.io/v1
       kind: Kustomization
       metadata:
@@ -35,6 +18,8 @@ patches:
       spec:
         decryption:
           provider: sops
+          secretRef:             
+            name: sops-age       
     target:
       kind: Kustomization
       name: flux-system
