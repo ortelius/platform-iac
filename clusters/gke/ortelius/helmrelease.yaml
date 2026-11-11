@@ -70,7 +70,9 @@ spec:
 
     relscanner-job: {}
 
-    arangodb: {}
+    arangodb:
+      ingress:
+        managedCertName: arangodb-managed-cert-2
 
   valuesFrom:
     - kind: Secret
